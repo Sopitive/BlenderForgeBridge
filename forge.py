@@ -202,7 +202,6 @@ def _parse_u8_auto(s) -> int:
     try:
         if t.lower().startswith("0x"):
             return int(t, 16) & 0xFF
-        # if it contains hex letters, treat as hex
         if any(ch in t.lower() for ch in "abcdef"):
             return int(t, 16) & 0xFF
         return int(t, 10) & 0xFF
@@ -406,7 +405,6 @@ def _on_team_enum_update(self, context):
 def _on_label_name_update(self, context):
     apply_scale_preview_if_needed(context, context.object)
 
-
 COSMIC_FORCE_DEFENDERS_TEAM = True
 COSMIC_RED_COLOR_VALUE = 1
 
@@ -436,6 +434,7 @@ class MemBridge:
         self.hproc = None
         self.dll_path = ""
         self._has_write_force = False
+        self._has_set_total = False  # NEW
 
     def _candidate_paths(self):
         blend_dir = bpy.path.abspath("//")
@@ -493,6 +492,15 @@ class MemBridge:
                 "membridge.dll is missing required export: mb_get_forge_object_array(HANDLE)."
             )
 
+        # NEW: optional export to set total count (sessionCtx+0x2E4 clamped by +0x2E0)
+        self._has_set_total = False
+        try:
+            self.dll.mb_set_forge_object_total_exported.argtypes = [c_void_p, c_int]
+            self.dll.mb_set_forge_object_total_exported.restype  = c_int
+            self._has_set_total = True
+        except Exception:
+            self._has_set_total = False
+
         return True
 
     def open_process(self, exe_name: str):
@@ -536,6 +544,16 @@ class MemBridge:
         # IMPORTANT: re-resolve EVERY time
         v = self.dll.mb_get_forge_object_array(self.hproc)
         return int(v) if v else 0
+
+    # NEW: set object total (UI count) to exported count (DLL clamps to cap at +0x2E0)
+    def set_forge_object_total(self, exported_count: int) -> bool:
+        if not self._has_set_total:
+            return False
+        try:
+            rc = self.dll.mb_set_forge_object_total_exported(self.hproc, c_int(int(exported_count)))
+            return rc == 1
+        except:
+            return False
 
 g_mb = MemBridge()
 
@@ -780,8 +798,6 @@ class VIEW3D_PT_h2a_forge_sidebar(Panel):
             box.label(text="Mapped Fields")
 
             col = box.column(align=True)
-
-            # NEW: expose the 0x3B byte right above flags (where it lives in memory)
             col.prop(o.h2a_forge, "pre_flags_byte")
 
             col.separator()
@@ -818,7 +834,7 @@ def build_entry_bytes(context, obj: bpy.types.Object):
     blob = _init_entry_for_type(type_id)
 
     # Rotation basis:
-    # Your working mapping expects forward = col[0], up = col[2]
+    # forward = col[0], up = col[2]
     m = obj.matrix_world
     fwd = Vector(m.col[0].xyz).normalized()
     up  = Vector(m.col[2].xyz).normalized()
@@ -830,9 +846,7 @@ def build_entry_bytes(context, obj: bpy.types.Object):
 
     p = obj.h2a_forge
 
-    # NEW: write the byte right before flags
     _write_u8(blob, OFF_PRE_FLAGS_BYTE, p.pre_flags_byte)
-
     _write_u8(blob, OFF_OBJECT_FLAGS,  p.object_flags)
     _write_u8(blob, OFF_CAN_DESPAWN,   p.can_despawn)
     _write_u8(blob, OFF_TEAM_INDEX,    resolve_team_byte(p))
@@ -928,6 +942,9 @@ class H2AForgeExportMemory(Operator):
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
 
+        base_addr = 0
+        written = 0
+        skipped = 0
         try:
             base_addr = g_mb.get_forge_object_array()
             if base_addr == 0:
@@ -961,6 +978,13 @@ class H2AForgeExportMemory(Operator):
                 if not g_mb.write(addr, bytes(b)):
                     self.report({"ERROR"}, f"Write failed at slot {i} addr=0x{addr:X} (dll='{g_mb.dll_path}')")
                     return {"CANCELLED"}
+
+            # NEW: update in-game total object count (sessionCtx+0x2E4), clamped by cap at +0x2E0
+            if g_mb._has_set_total:
+                ok = g_mb.set_forge_object_total(written)
+                if not ok:
+                    # Non-fatal: export succeeded, only the UI count didn't update
+                    self.report({"WARNING"}, "Exported objects, but failed to update object total count (mb_set_forge_object_total_exported failed).")
 
         finally:
             g_mb.close()
