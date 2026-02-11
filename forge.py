@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Forge Bridge",
     "author": "Sopitive",
-    "version": (0, 3, 14),  # bumped for import feature
+    "version": (0, 3, 15),  # bumped for name-stable label mapping
     "blender": (3, 0, 0),
     "location": "View3D > N-panel > Forge tab, Add (Shift+A) > Forge Objects, File > Export/Import > H2A Forge Objects",
     "description": "Spawn forge objects from a Props scene and export/import them into H2A forge object array via membridge.dll",
@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import string
+import base64
 from ctypes import (
     cdll,
     c_void_p, c_char_p, c_uint64, c_int,
@@ -152,6 +153,9 @@ OFF_TAIL_FLAG = ENTRY_STRIDE - 2
 LABEL_BLOB_SIZE = 0x120A
 LABEL_BLOB_BACK = 0x120A
 
+# Label dropdown uses NAME identifiers (stable across refresh / gametypes)
+LABEL_NONE_ID = "__NONE__"
+
 # =============================================================================
 # Object type mapping (TOP + SUB + PRE 0x3B)
 # =============================================================================
@@ -161,19 +165,22 @@ OBJECT_TYPE_INFO = {
     "Teleporter, Receiver":   (0x2A, 0x01, 0x0F),
     "Teleporter, Two Way":    (0x2A, 0x02, 0x0D),
 
+    "Grass Plane":       (0x4D, 0x09, 0x00),
     "Block, 5x5, Flat":       (0x50, 0x1A, 0x00),
     "Block, 10x10, Flat":     (0x50, 0x1E, 0x00),
+    "Pyramid":     (0x52, 0x06, 0x00),
 
     "Wall, Coliseum":         (0x54, 0x0B, 0x00),
     "Grid":                   (0x56, 0x00, 0x00),
 
+    "Mongoose":                (0x1C, 0x00, 0x00),
     "Warthog":                (0x1D, 0x00, 0x00),
     "Scorpion":               (0x1E, 0x00, 0x00),
     "Respawn Point":          (0x34, 0x00, 0x10),
     "Initial Spawn Point":    (0x33, 0x00, 0x10),
 }
 
-# Reverse lookup: (top, sub, pre3b) -> name
+# Reverse lookup: (top, sub, pre 0x3B) -> name
 TYPEKEY_TO_NAME = {}
 TYPEKEY_TO_NAME_LOOSE = {}  # optional: ignore pre3b
 for nm, info in OBJECT_TYPE_INFO.items():
@@ -186,7 +193,6 @@ for nm, info in OBJECT_TYPE_INFO.items():
     TYPEKEY_TO_NAME_LOOSE[(int(top)&0xFF, int(sub)&0xFF)] = nm
 
 UNMAPPED_TEMPLATE = "__UNMAPPED__"
-
 
 OBJECT_TYPE_ITEMS = [(k, k, "") for k in OBJECT_TYPE_INFO.keys()]
 
@@ -201,18 +207,6 @@ DEFAULT_PRE_FLAGS_BY_TYPE = {
 
 def _default_pre_flags_for_type(top_id: int) -> int:
     return int(DEFAULT_PRE_FLAGS_BY_TYPE.get(int(top_id) & 0xFF, 0)) & 0xFF
-
-def mark_unmapped(obj, top_id, sub_id, pre3b):
-    obj["h2a_unmapped"] = True
-    obj["h2a_top_id"] = int(top_id) & 0xFF
-    obj["h2a_sub_id"] = int(sub_id) & 0xFF
-    obj["h2a_pre3b"]  = int(pre3b) & 0xFF
-
-def clear_unmapped(obj):
-    for k in ("h2a_unmapped", "h2a_top_id", "h2a_sub_id", "h2a_pre3b"):
-        if k in obj:
-            del obj[k]
-
 
 # =============================================================================
 # Helpers
@@ -326,6 +320,26 @@ def parse_forge_labels_from_blob(blob: bytes):
     return uniq
 
 # =============================================================================
+# Label blob snapshot helpers (optional - keeps labels stable even if memory labels change)
+# =============================================================================
+
+def _b64_from_bytes(b: bytes) -> str:
+    if not b:
+        return ""
+    return base64.b64encode(b).decode("ascii")
+
+def _bytes_from_b64(s: str) -> bytes:
+    try:
+        if not s:
+            return b""
+        return base64.b64decode(s.encode("ascii"), validate=False)
+    except:
+        return b""
+
+def _label_blob_addr_from_forge_array(forge_array_addr: int) -> int:
+    return int(forge_array_addr) - int(LABEL_BLOB_BACK)
+
+# =============================================================================
 # Unmapped type tracking
 # =============================================================================
 
@@ -345,7 +359,6 @@ def mark_unmapped(obj, top_id: int, sub_id: int, pre3b: int):
 def clear_unmapped(obj):
     if not obj:
         return
-    # keep safe if keys aren't present
     if UNMAPPED_KEY in obj: del obj[UNMAPPED_KEY]
     if UNMAPPED_TOP in obj: del obj[UNMAPPED_TOP]
     if UNMAPPED_SUB in obj: del obj[UNMAPPED_SUB]
@@ -372,17 +385,14 @@ def get_export_type_triple(obj):
         except:
             pass
 
-    # mapped path
     try:
         info = _get_type_info(obj.h2a_forge.template_name)
         if not info:
             return None
         top_id, sub_id, pre3b_default = info
-        # we always export the current UI-edited pre_flags_byte at 0x3B
         return (int(top_id) & 0xFF, int(sub_id) & 0xFF, int(obj.h2a_forge.pre_flags_byte) & 0xFF)
     except:
         return None
-
 
 def _is_scale_label_name(name: str) -> bool:
     return "scale" in (name or "").strip().lower()
@@ -450,16 +460,13 @@ def _resolve_template_name_from_ids(top_id: int, sub_id: int, pre3b: int) -> str
     if nm:
         return nm
 
-    # If pre3b wasn't mapped yet, fall back to pair match.
     cands = _TYPE_BY_PAIR.get((top_id, sub_id), [])
     if len(cands) == 1:
         return cands[0][1]
-    # If multiple, prefer matching pre3b if present in candidates (already tried exact),
-    # else just pick the first deterministic (sorted by pre3b).
     if cands:
         cands_sorted = sorted(cands, key=lambda t: t[0])
         return cands_sorted[0][1]
-    return ""  # unknown
+    return ""
 
 def _ensure_import_collection(scene: bpy.types.Scene, name: str = "Imported Forge"):
     coll = bpy.data.collections.get(name, None)
@@ -469,9 +476,7 @@ def _ensure_import_collection(scene: bpy.types.Scene, name: str = "Imported Forg
     return coll
 
 def _make_placeholder_mesh(name: str):
-    # Create a simple cube mesh if we don't have a palette model yet.
     mesh = bpy.data.meshes.new(name + "_mesh")
-    bm = bpy.data.meshes.new_from_object  # just to avoid unused lint in some environments
     verts = [
         (-0.5,-0.5,-0.5), (0.5,-0.5,-0.5), (0.5,0.5,-0.5), (-0.5,0.5,-0.5),
         (-0.5,-0.5, 0.5), (0.5,-0.5, 0.5), (0.5,0.5, 0.5), (-0.5,0.5, 0.5),
@@ -511,408 +516,135 @@ def _create_object_from_template_or_placeholder(context, template_name: str, top
 
     return obj
 
-def _unpack_object_flags_to_props(flags_u8: int, p):
-    b = int(flags_u8) & 0xFF
-
-    phys_bits = (b >> 6) & 0x3
-    if phys_bits == 0:
-        p.physics_mode_enum = "NORMAL"
-    elif phys_bits == 1:
-        p.physics_mode_enum = "FIXED"
-    else:
-        p.physics_mode_enum = "PHASED"
-
-    gs = (b >> 5) & 0x1
-    p.game_specific_enum = "1" if gs else "0"
-
-    sym_bits = (b >> 2) & 0x3
-    if sym_bits == 0:
-        p.symmetry_enum = "NONE"
-    elif sym_bits == 1:
-        p.symmetry_enum = "SYMMETRIC"
-    elif sym_bits == 2:
-        p.symmetry_enum = "ASYMMETRIC"
-    else:
-        p.symmetry_enum = "BOTH"
-
-    not_pas = (b >> 1) & 0x1
-    p.place_at_start_enum = "0" if not_pas else "1"
-
-def _unpack_passability_flags_to_props(pass_u8: int, p):
-    b = int(pass_u8) & 0xFF
-    p.pass_players_enum = "BLOCK" if (b & 0x01) else "ALLOW"
-    p.pass_land_enum = "ALLOW" if (b & 0x02) else "BLOCK"
-    p.pass_heavy_enum = "ALLOW" if (b & 0x04) else "BLOCK"
-    p.pass_flying_enum = "ALLOW" if (b & 0x08) else "BLOCK"
-    p.pass_projectiles_enum = "ALLOW" if (b & 0x10) else "BLOCK"
-
 def _u8_color_to_enum(u: int) -> str:
     u = int(u) & 0xFF
     return "FF" if u == 0xFF else str(u)
 
 def _tele_chan_to_enum(u: int) -> str:
     u = int(u) & 0xFF
-    # valid: 0..25 or 0xFF
     if u == 0xFF:
         return "255"
     if 0 <= u <= 25:
         return str(u)
-    return "255"  # fallback to None for unknown/out-of-range
+    return "255"
 
+# =============================================================================
+# Label model + name-based mapping (stable across gametypes)
+# =============================================================================
 
+class H2AForgeLabelItem(PropertyGroup):
+    name: StringProperty(name="Name", default="")
+    index: IntProperty(name="Index", default=0, min=0)
 
-def _u8(b):
-    return int(b) & 0xFF
+def _find_label_index_by_name(context, label_name: str) -> int:
+    """
+    Returns current index for a label NAME in the current scene label table.
+    Case-insensitive match.
+    If not found or name is empty/None -> 0xFF.
+    """
+    nm = (label_name or "").strip()
+    if not nm or nm == LABEL_NONE_ID:
+        return 0xFF
 
-def _read_f32_le(b: bytes, off: int) -> float:
     try:
-        return struct.unpack_from("<f", b, off)[0]
-    except:
-        return 0.0
-
-def _read_vec3(b: bytes, off: int) -> Vector:
-    return Vector((
-        _read_f32_le(b, off + 0),
-        _read_f32_le(b, off + 4),
-        _read_f32_le(b, off + 8),
-    ))
-
-def _object_flags_to_enums(p, obj_flags_u8: int):
-    """
-    Inverse of pack_object_flags():
-      bits 6..7: physics
-      bit 5: game_specific
-      bits 2..3: symmetry
-      bit 1: NOT place-at-start
-    """
-    b = int(obj_flags_u8) & 0xFF
-
-    phys_bits = (b >> 6) & 0x3
-    if phys_bits == 0:
-        p.physics_mode_enum = "NORMAL"
-    elif phys_bits == 1:
-        p.physics_mode_enum = "FIXED"
-    else:
-        p.physics_mode_enum = "PHASED"  # includes 3
-
-    gs = (b >> 5) & 0x1
-    p.game_specific_enum = "1" if gs else "0"
-
-    sym_bits = (b >> 2) & 0x3
-    if sym_bits == 0:
-        p.symmetry_enum = "NONE"
-    elif sym_bits == 1:
-        p.symmetry_enum = "SYMMETRIC"
-    elif sym_bits == 2:
-        p.symmetry_enum = "ASYMMETRIC"
-    else:
-        p.symmetry_enum = "BOTH"
-
-    not_pas = (b >> 1) & 0x1
-    pas = 0 if not_pas else 1
-    p.place_at_start_enum = "1" if pas else "0"
-
-def _safe_set_enum(prop_owner, attr: str, value_str: str, fallback_str: str):
-    """
-    Blender enum assignment hard-fails if value isn't in items.
-    This helper clamps to fallback.
-    """
-    try:
-        setattr(prop_owner, attr, value_str)
-    except:
-        try:
-            setattr(prop_owner, attr, fallback_str)
-        except:
-            pass
-
-def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_index: int = -1, *args):
-    """
-    Apply one 0x4C forge entry (memory) onto a Blender object.
-
-    IMPORTANT: This accepts extra args (*args) so older/newer call sites that pass
-    (context, obj, entry, slot, base_addr, something, ...) won't crash.
-
-    Rotation (kept in the same convention as your exporter):
-        fwd @ OFF_FWD -> matrix col[0]
-        up  @ OFF_UP  -> matrix col[2]
-      We reconstruct col[1] and orthonormalize.
-
-    Also:
-      - enum safety (prevents "enum not found" crashes)
-      - mapped/unmapped marking (so unmapped objects don't export as DEFAULT)
-    """
-    from mathutils import Vector, Matrix
-
-    # ------------------------------------------------------------
-    # SLOT INDEX COMPAT:
-    # Some call sites pass slot_index as the 4th arg, others may pass
-    # junk or pass slot later. If slot_index isn't an int, try args[0].
-    # ------------------------------------------------------------
-    try:
-        slot_index_i = int(slot_index)
-    except:
-        slot_index_i = -1
-        if args:
+        sp = context.scene.h2a_forge
+        for it in sp.forge_labels:
             try:
-                slot_index_i = int(args[0])
+                itnm = str(it.name or "").strip()
+                if itnm and itnm.lower() == nm.lower():
+                    return int(it.index) & 0xFF
             except:
-                slot_index_i = -1
-
-    # -------------------------
-    # tiny readers
-    # -------------------------
-    def _u8(off):
-        return entry[off] if (entry and len(entry) > off) else 0
-
-    def _s8(off):
-        v = _u8(off)
-        return v - 256 if v >= 128 else v
-
-    def _f32(off):
-        try:
-            return struct.unpack_from("<f", entry, off)[0]
-        except:
-            return 0.0
-
-    def _v3(off):
-        return Vector((_f32(off + 0), _f32(off + 4), _f32(off + 8)))
-
-    # -------------------------
-    # unpack core
-    # -------------------------
-    top_id = _u8(0x00)
-    sub_id = _u8(OFF_U16_TYPECONST)  # low byte of u16 at 0x30
-    pre3b  = _u8(OFF_PRE_FLAGS_BYTE)
-
-    pos = _v3(OFF_POS)
-    fwd = _v3(OFF_FWD)
-    up  = _v3(OFF_UP)
-
-    # -------------------------
-    # rotation convention (same as exporter):
-    #   col[0] = fwd
-    #   col[2] = up
-    #   col[1] = up x fwd  (right-handed)
-    #   re-orthogonalize
-    # -------------------------
-    x = Vector(fwd)
-    z = Vector(up)
-
-    if x.length < 1e-8:
-        x = Vector((1.0, 0.0, 0.0))
-    else:
-        x.normalize()
-
-    if z.length < 1e-8:
-        z = Vector((0.0, 0.0, 1.0))
-    else:
-        z.normalize()
-
-    y = z.cross(x)
-    if y.length < 1e-8:
-        alt = Vector((0.0, 1.0, 0.0)) if abs(x.dot(Vector((0, 1, 0)))) < 0.99 else Vector((0.0, 0.0, 1.0))
-        z = alt
-        z.normalize()
-        y = z.cross(x)
-
-    if y.length < 1e-8:
-        y = Vector((0.0, 1.0, 0.0))
-    else:
-        y.normalize()
-
-    z = x.cross(y)
-    if z.length < 1e-8:
-        z = Vector((0.0, 0.0, 1.0))
-    else:
-        z.normalize()
-
-    mw = Matrix((
-        (x.x, y.x, z.x, pos.x),
-        (x.y, y.y, z.y, pos.y),
-        (x.z, y.z, z.z, pos.z),
-        (0.0, 0.0, 0.0, 1.0),
-    ))
-    obj.matrix_world = mw
-
-    # -------------------------
-    # type mapping (mapped vs unmapped)
-    # expects:
-    #   TYPEKEY_TO_NAME, TYPEKEY_TO_NAME_LOOSE
-    #   mark_unmapped(obj, top, sub, pre3b), clear_unmapped(obj)
-    # -------------------------
-    name = None
-    try:
-        key = (int(top_id) & 0xFF, int(sub_id) & 0xFF, int(pre3b) & 0xFF)
-        name = TYPEKEY_TO_NAME.get(key)
-        if not name:
-            name = TYPEKEY_TO_NAME_LOOSE.get((int(top_id) & 0xFF, int(sub_id) & 0xFF))
-    except:
-        name = None
-
-    if name:
-        obj.h2a_forge.template_name = name
-        obj.h2a_forge.pre_flags_byte = int(pre3b) & 0xFF
-        try:
-            clear_unmapped(obj)
-        except:
-            pass
-    else:
-        # keep UI sane, but mark as unmapped so EXPORT can skip
-        obj.h2a_forge.template_name = DEFAULT_OBJECT_TYPE
-        obj.h2a_forge.pre_flags_byte = int(pre3b) & 0xFF
-        try:
-            mark_unmapped(obj, top_id, sub_id, pre3b)
-        except:
-            pass
-        try:
-            obj.name = f"UNMAPPED_{top_id:02X}_{sub_id:02X}_{pre3b:02X}"
-        except:
-            pass
-
-    # -------------------------
-    # apply remaining bytes -> props (with enum safety)
-    # -------------------------
-    p = obj.h2a_forge
-
-    # pre3b
-    p.pre_flags_byte = int(pre3b) & 0xFF
-
-    # object flags byte -> dropdown enums
-    flags = _u8(OFF_OBJECT_FLAGS)
-    phys_bits = (flags >> 6) & 0x3
-    gs_bit    = (flags >> 5) & 0x1
-    sym_bits  = (flags >> 2) & 0x3
-    not_pas   = (flags >> 1) & 0x1
-
-    p.physics_mode_enum   = "NORMAL" if phys_bits == 0 else ("FIXED" if phys_bits == 1 else "PHASED")
-    p.game_specific_enum  = "1" if gs_bit else "0"
-    p.symmetry_enum       = "NONE" if sym_bits == 0 else ("SYMMETRIC" if sym_bits == 1 else ("ASYMMETRIC" if sym_bits == 2 else "BOTH"))
-    p.place_at_start_enum = "1" if (not_pas == 0) else "0"
-
-    p.can_despawn = _u8(OFF_CAN_DESPAWN)
-
-    # team enum safety (0..8 only)
-    team_u = _u8(OFF_TEAM_INDEX)
-    if team_u > 8:
-        team_u = 8
-    p.team_enum = str(int(team_u))
-
-    p.spawn_time = _u8(OFF_SPAWN_TIME)
-
-    # object color enum safety: ('FF','0'..'7')
-    col_u = _u8(OFF_OBJECT_COLOR)
-    if col_u == 0xFF:
-        p.object_color_enum = "FF"
-    elif 0 <= col_u <= 7:
-        p.object_color_enum = str(int(col_u))
-    else:
-        p.object_color_enum = "FF"
-
-    p.spawn_sequence  = int(_s8(OFF_SPAWN_SEQ))
-    p.timer_user_data = int(_s8(OFF_TIMER_USER))
-
-    p.spawn_channel = _u8(OFF_SPAWN_CHAN)
-
-    # labels (enum supports "255" + indices)
-    p.label_enum_1 = str(_u8(OFF_LABEL_1))
-    p.label_enum_2 = str(_u8(OFF_LABEL_2))
-    p.label_enum_3 = str(_u8(OFF_LABEL_3))
-    p.label_enum_4 = str(_u8(OFF_LABEL_4))
-
-    # teleporter channel enum safety: 0..25 plus 255
-    tele_u = _u8(OFF_TELE_CHAN)
-    if tele_u == 0xFF:
-        p.teleporter_channel_enum = "255"
-    elif 0 <= tele_u <= 25:
-        p.teleporter_channel_enum = str(int(tele_u))
-    else:
-        p.teleporter_channel_enum = "255"
-
-    # pass flags -> dropdown enums
-    pass_b = _u8(OFF_PASS_FLAGS)
-    p.pass_players_enum     = "BLOCK" if (pass_b & 0x01) else "ALLOW"  # inverted
-    p.pass_land_enum        = "ALLOW" if (pass_b & 0x02) else "BLOCK"
-    p.pass_heavy_enum       = "ALLOW" if (pass_b & 0x04) else "BLOCK"
-    p.pass_flying_enum      = "ALLOW" if (pass_b & 0x08) else "BLOCK"
-    p.pass_projectiles_enum = "ALLOW" if (pass_b & 0x10) else "BLOCK"
-
-    # re-apply scale preview if needed
-    try:
-        apply_scale_preview_if_needed(context, obj)
+                continue
     except:
         pass
+    return 0xFF
 
-    # optional: store slot index for debugging
-    if slot_index_i >= 0:
-        obj["h2a_forge_slot"] = int(slot_index_i)
+def _find_label_name_by_index(context, idx_u8: int) -> str:
+    if (int(idx_u8) & 0xFF) == 0xFF:
+        return ""
+    try:
+        sp = context.scene.h2a_forge
+        for it in sp.forge_labels:
+            if (int(it.index) & 0xFF) == (int(idx_u8) & 0xFF):
+                return str(it.name or "").strip()
+    except:
+        pass
+    return ""
 
+def _label_items_from_scene(context):
+    # Enum identifiers are LABEL NAMES (stable) not indices.
+    items = [(LABEL_NONE_ID, "(No Label)", "No Label (0xFF)")]
+    if not context:
+        return items
 
+    try:
+        sp = context.scene.h2a_forge
+    except:
+        return items
 
-
-
-def _read_all_entries_from_memory(context, base_addr: int, limit: int):
-    entries = []
-    for i in range(int(limit)):
-        raw = g_mb.read(base_addr + i * ENTRY_STRIDE, ENTRY_STRIDE)
-        if not raw or len(raw) != ENTRY_STRIDE:
-            break
-        if _entry_is_empty(raw):
-            if i == 0:
-                break
-            if not _entry_has_more_after(raw):
-                break
+    temp = []
+    for it in sp.forge_labels:
+        try:
+            idx = int(it.index) & 0xFF
+            nm = str(it.name or "").strip()
+        except:
             continue
-        entries.append((i, raw))
-        if not _entry_has_more_after(raw):
-            break
-    return entries
+        if idx == 0xFF:
+            continue
+        if not nm:
+            continue
+        temp.append((idx, nm))
 
-# =============================================================================
-# RAW TEMPLATES
-# =============================================================================
+    temp.sort(key=lambda t: (t[1].lower(), t[0]))
 
-def _hex_to_bytes(s: str) -> bytes:
-    s = s.strip().replace("\n", " ").replace("\t", " ")
-    s = re.sub(r"[^0-9A-Fa-f]", " ", s)
-    parts = [p for p in s.split(" ") if p]
-    return bytes(int(p, 16) for p in parts)
+    for idx, nm in temp:
+        # Identifier = name, so dropdown won't change when indices reorder.
+        items.append((nm, nm, f"Forge Label '{nm}' (current index {idx})"))
+    return items
 
-def _ensure_len(name: str, b: bytes, expected: int) -> bytes:
-    if len(b) == expected:
-        return b
-    if len(b) > expected:
-        return b[:expected]
-    return b + bytes([0] * (expected - len(b)))
+def genForgeLabelEnumItems(self, context):
+    return _label_items_from_scene(context)
 
-EMPTY_SLOT_HEX = """
-FF FF FF FF FF FF
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 00
-FF FF
-00 00 00 00 00 00 00 00 00 00 00 00 00 00
-08 00 FF 00 00 00
-FF FF FF FF
-00 00 00 00
-"""
-EMPTY_SLOT_BYTES = _ensure_len("EMPTY_SLOT_BYTES", _hex_to_bytes(EMPTY_SLOT_HEX), ENTRY_STRIDE)
+def _label_enum_to_name(enum_str: str) -> str:
+    s = (enum_str or "").strip()
+    if not s or s == LABEL_NONE_ID:
+        return ""
+    return s
 
-def _init_entry_for_type(top_id: int, sub_id: int, pre3b: int) -> bytearray:
-    blob = bytearray(EMPTY_SLOT_BYTES)
-    blob[0] = int(top_id) & 0xFF
-    blob[1] = 0x00
-    blob[2:6] = b"\xFF\xFF\xFF\xFF"
-    blob[OFF_F32_A:OFF_F32_A+4] = _pack_f32(1.0)
-    blob[OFF_U16_FFFF:OFF_U16_FFFF+2] = _pack_u16(0xFFFF)
+def _label_name_to_enum(label_name: str) -> str:
+    nm = (label_name or "").strip()
+    return LABEL_NONE_ID if not nm else nm
 
-    # sub palette id @ 0x30 (low byte)
-    blob[OFF_U16_TYPECONST:OFF_U16_TYPECONST+2] = _pack_u16(int(sub_id) & 0xFF)
+def _rebind_object_label_enums_from_names(context, obj):
+    """
+    After label refresh, re-apply enum selections from stored label_name_* so
+    the dropdown doesn't "clobber" just because indices changed.
+    """
+    if not obj or not hasattr(obj, "h2a_forge"):
+        return
+    p = obj.h2a_forge
+    for i in (1, 2, 3, 4):
+        name_attr = f"label_name_{i}"
+        enum_attr = f"label_enum_{i}"
+        nm = (getattr(p, name_attr, "") or "").strip()
+        target = _label_name_to_enum(nm)
+        try:
+            setattr(p, enum_attr, target)
+        except:
+            # If label name isn't present in the current label list,
+            # fall back to none (keeps selection stable conceptually)
+            try:
+                setattr(p, enum_attr, LABEL_NONE_ID)
+            except:
+                pass
 
-    # pre-flags @ 0x3B
-    blob[OFF_PRE_FLAGS_BYTE] = int(pre3b) & 0xFF
-
-    _set_tail_flag(blob, False)
-    return blob
+def _rebind_all_objects_after_label_refresh(context):
+    try:
+        for obj in context.scene.objects:
+            if is_forge_object(obj) and hasattr(obj, "h2a_forge"):
+                _rebind_object_label_enums_from_names(context, obj)
+    except:
+        pass
 
 # =============================================================================
 # Scaling logic
@@ -994,8 +726,7 @@ def _timer_to_scale_factor_330x(timer_s8: int, team_enum_value: int) -> float:
 
 def _any_selected_label_is_scale(context, p) -> bool:
     for attr in ("label_enum_1", "label_enum_2", "label_enum_3", "label_enum_4"):
-        idx = _label_enum_to_u8(getattr(p, attr, "255"))
-        nm = _get_label_name_by_index(context, idx)
+        nm = _label_enum_to_name(getattr(p, attr, LABEL_NONE_ID))
         if _is_scale_label_name(nm):
             return True
     return False
@@ -1027,7 +758,30 @@ def _on_team_enum_update(self, context):
     apply_scale_preview_if_needed(context, context.object)
 
 def _on_label_enum_update(self, context):
-    apply_scale_preview_if_needed(context, context.object)
+    """
+    Update callback for label dropdowns:
+    - Persist the selected LABEL NAME into label_name_1..4
+    - Apply scale preview (since it depends on name "scale")
+    """
+    try:
+        # Determine which PropertyGroup instance we are (object props)
+        p = self
+        # Keep label_name_* aligned with label_enum_*
+        for i in (1, 2, 3, 4):
+            enum_attr = f"label_enum_{i}"
+            name_attr = f"label_name_{i}"
+            try:
+                sel = getattr(p, enum_attr, LABEL_NONE_ID)
+            except:
+                sel = LABEL_NONE_ID
+            nm = _label_enum_to_name(sel)
+            try:
+                setattr(p, name_attr, nm)
+            except:
+                pass
+        apply_scale_preview_if_needed(context, context.object)
+    except:
+        pass
 
 COSMIC_FORCE_DEFENDERS_TEAM = True
 COSMIC_RED_COLOR_VALUE = 1
@@ -1314,12 +1068,24 @@ def createForgeObject(context, leafCollectionName: str):
         except:
             pre3b_default = 0
     new_obj.h2a_forge.pre_flags_byte = pre3b_default
-    
+
     try:
         clear_unmapped(new_obj)
     except:
         pass
 
+    # Default labels to None (by name)
+    try:
+        new_obj.h2a_forge.label_name_1 = ""
+        new_obj.h2a_forge.label_name_2 = ""
+        new_obj.h2a_forge.label_name_3 = ""
+        new_obj.h2a_forge.label_name_4 = ""
+        new_obj.h2a_forge.label_enum_1 = LABEL_NONE_ID
+        new_obj.h2a_forge.label_enum_2 = LABEL_NONE_ID
+        new_obj.h2a_forge.label_enum_3 = LABEL_NONE_ID
+        new_obj.h2a_forge.label_enum_4 = LABEL_NONE_ID
+    except:
+        pass
 
     bpy.ops.object.select_all(action='DESELECT')
     new_obj.select_set(True)
@@ -1373,67 +1139,6 @@ def _on_template_name_update(self, context):
             pass
     except:
         pass
-
-# =============================================================================
-# Label model
-# =============================================================================
-
-class H2AForgeLabelItem(PropertyGroup):
-    name: StringProperty(name="Name", default="")
-    index: IntProperty(name="Index", default=0, min=0)
-
-def _label_items_from_scene(context):
-    items = [("255", "(No Label)", "No Label (0xFF)")]
-    if not context:
-        return items
-    try:
-        sp = context.scene.h2a_forge
-    except:
-        return items
-
-    temp = []
-    for it in sp.forge_labels:
-        try:
-            idx = int(it.index) & 0xFF
-            nm = str(it.name or "").strip()
-        except:
-            continue
-        if idx == 0xFF:
-            continue
-        if not nm:
-            nm = f"Label {idx}"
-        temp.append((idx, nm))
-
-    temp.sort(key=lambda t: (t[0], t[1].lower()))
-
-    for idx, nm in temp:
-        items.append((str(idx), nm, f"Forge Label {idx}"))
-    return items
-
-def genForgeLabelEnumItems(self, context):
-    return _label_items_from_scene(context)
-
-def _label_enum_to_u8(enum_str: str) -> int:
-    try:
-        v = int(enum_str)
-    except:
-        v = 255
-    return v & 0xFF
-
-def _label_u8_to_enum(u: int) -> str:
-    return str(int(u) & 0xFF)
-
-def _get_label_name_by_index(context, idx: int) -> str:
-    if idx == 0xFF:
-        return "(No Label)"
-    try:
-        sp = context.scene.h2a_forge
-        for it in sp.forge_labels:
-            if (int(it.index) & 0xFF) == (idx & 0xFF):
-                return str(it.name or "").strip()
-    except:
-        pass
-    return ""
 
 # =============================================================================
 # Properties / Sidebar Panel
@@ -1517,6 +1222,13 @@ class H2AForgeObjectProps(PropertyGroup):
 
     spawn_channel: IntProperty(name="Spawn Channel", default=0xFF, min=0, max=255)
 
+    # Persisted label NAMEs (stable across label refresh / gametypes)
+    label_name_1: StringProperty(name="LabelName1", default="")
+    label_name_2: StringProperty(name="LabelName2", default="")
+    label_name_3: StringProperty(name="LabelName3", default="")
+    label_name_4: StringProperty(name="LabelName4", default="")
+
+    # Dropdowns are NAME identifiers (not indices)
     label_enum_1: EnumProperty(name="Label 1", items=genForgeLabelEnumItems, update=_on_label_enum_update)
     label_enum_2: EnumProperty(name="Label 2", items=genForgeLabelEnumItems, update=_on_label_enum_update)
     label_enum_3: EnumProperty(name="Label 3", items=genForgeLabelEnumItems, update=_on_label_enum_update)
@@ -1539,6 +1251,10 @@ class H2AForgeSceneProps(PropertyGroup):
     target_exe: StringProperty(name="Target EXE", default="MCC-Win64-Shipping.exe")
     confirm_overwrite: BoolProperty(name="I understand this overwrites forge memory", default=False)
     forge_labels: CollectionProperty(type=H2AForgeLabelItem)
+
+    # Optional: snapshot of labels blob captured on import (lets you restore exact label table if desired)
+    imported_label_blob_b64: StringProperty(name="Imported Label Blob (b64)", default="")
+    imported_label_blob_size: IntProperty(name="Imported Label Blob Size", default=0, min=0)
 
     # Import options
     import_clear_existing: BoolProperty(
@@ -1610,7 +1326,7 @@ class VIEW3D_PT_h2a_forge_sidebar(Panel):
             col.prop(o.h2a_forge, "spawn_channel")
 
             col.separator()
-            col.label(text="Labels")
+            col.label(text="Labels (Name-mapped)")
             col.prop(o.h2a_forge, "label_enum_1")
             col.prop(o.h2a_forge, "label_enum_2")
             col.prop(o.h2a_forge, "label_enum_3")
@@ -1628,31 +1344,286 @@ class VIEW3D_PT_h2a_forge_sidebar(Panel):
             col.prop(o.h2a_forge, "pass_projectiles_enum")
 
 # =============================================================================
+# Import/Export entry application
+# =============================================================================
+
+def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_index: int = -1, *args):
+    """
+    Apply one 0x4C forge entry (memory) onto a Blender object.
+
+    IMPORTANT:
+      - Labels are now stored on the object by NAME (label_name_1..4).
+      - Dropdown enums use NAME identifiers; refresh will not clobber.
+    """
+    from mathutils import Vector, Matrix
+
+    try:
+        slot_index_i = int(slot_index)
+    except:
+        slot_index_i = -1
+
+    def _u8(off):
+        return entry[off] if (entry and len(entry) > off) else 0
+
+    def _s8(off):
+        v = _u8(off)
+        return v - 256 if v >= 128 else v
+
+    def _f32(off):
+        try:
+            return struct.unpack_from("<f", entry, off)[0]
+        except:
+            return 0.0
+
+    def _v3(off):
+        return Vector((_f32(off + 0), _f32(off + 4), _f32(off + 8)))
+
+    top_id = _u8(0x00)
+    sub_id = _u8(OFF_U16_TYPECONST)
+    pre3b  = _u8(OFF_PRE_FLAGS_BYTE)
+
+    pos = _v3(OFF_POS)
+    fwd = _v3(OFF_FWD)
+    up  = _v3(OFF_UP)
+
+    x = Vector(fwd)
+    z = Vector(up)
+
+    if x.length < 1e-8:
+        x = Vector((1.0, 0.0, 0.0))
+    else:
+        x.normalize()
+
+    if z.length < 1e-8:
+        z = Vector((0.0, 0.0, 1.0))
+    else:
+        z.normalize()
+
+    y = z.cross(x)
+    if y.length < 1e-8:
+        alt = Vector((0.0, 1.0, 0.0)) if abs(x.dot(Vector((0, 1, 0)))) < 0.99 else Vector((0.0, 0.0, 1.0))
+        z = alt
+        z.normalize()
+        y = z.cross(x)
+
+    if y.length < 1e-8:
+        y = Vector((0.0, 1.0, 0.0))
+    else:
+        y.normalize()
+
+    z = x.cross(y)
+    if z.length < 1e-8:
+        z = Vector((0.0, 0.0, 1.0))
+    else:
+        z.normalize()
+
+    mw = Matrix((
+        (x.x, y.x, z.x, pos.x),
+        (x.y, y.y, z.y, pos.y),
+        (x.z, y.z, z.z, pos.z),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+    obj.matrix_world = mw
+
+    name = None
+    try:
+        key = (int(top_id) & 0xFF, int(sub_id) & 0xFF, int(pre3b) & 0xFF)
+        name = TYPEKEY_TO_NAME.get(key)
+        if not name:
+            name = TYPEKEY_TO_NAME_LOOSE.get((int(top_id) & 0xFF, int(sub_id) & 0xFF))
+    except:
+        name = None
+
+    if name:
+        obj.h2a_forge.template_name = name
+        obj.h2a_forge.pre_flags_byte = int(pre3b) & 0xFF
+        try:
+            clear_unmapped(obj)
+        except:
+            pass
+    else:
+        obj.h2a_forge.template_name = DEFAULT_OBJECT_TYPE
+        obj.h2a_forge.pre_flags_byte = int(pre3b) & 0xFF
+        try:
+            mark_unmapped(obj, top_id, sub_id, pre3b)
+        except:
+            pass
+        try:
+            obj.name = f"UNMAPPED_{top_id:02X}_{sub_id:02X}_{pre3b:02X}"
+        except:
+            pass
+
+    p = obj.h2a_forge
+    p.pre_flags_byte = int(pre3b) & 0xFF
+
+    flags = _u8(OFF_OBJECT_FLAGS)
+    phys_bits = (flags >> 6) & 0x3
+    gs_bit    = (flags >> 5) & 0x1
+    sym_bits  = (flags >> 2) & 0x3
+    not_pas   = (flags >> 1) & 0x1
+
+    p.physics_mode_enum   = "NORMAL" if phys_bits == 0 else ("FIXED" if phys_bits == 1 else "PHASED")
+    p.game_specific_enum  = "1" if gs_bit else "0"
+    p.symmetry_enum       = "NONE" if sym_bits == 0 else ("SYMMETRIC" if sym_bits == 1 else ("ASYMMETRIC" if sym_bits == 2 else "BOTH"))
+    p.place_at_start_enum = "1" if (not_pas == 0) else "0"
+
+    p.can_despawn = _u8(OFF_CAN_DESPAWN)
+
+    team_u = _u8(OFF_TEAM_INDEX)
+    if team_u > 8:
+        team_u = 8
+    p.team_enum = str(int(team_u))
+
+    p.spawn_time = _u8(OFF_SPAWN_TIME)
+
+    col_u = _u8(OFF_OBJECT_COLOR)
+    if col_u == 0xFF:
+        p.object_color_enum = "FF"
+    elif 0 <= col_u <= 7:
+        p.object_color_enum = str(int(col_u))
+    else:
+        p.object_color_enum = "FF"
+
+    p.spawn_sequence  = int(_s8(OFF_SPAWN_SEQ))
+    p.timer_user_data = int(_s8(OFF_TIMER_USER))
+
+    p.spawn_channel = _u8(OFF_SPAWN_CHAN)
+
+    # -------------------------
+    # LABELS: memory stores indices; we map to NAMES and persist.
+    # -------------------------
+    li1 = _u8(OFF_LABEL_1)
+    li2 = _u8(OFF_LABEL_2)
+    li3 = _u8(OFF_LABEL_3)
+    li4 = _u8(OFF_LABEL_4)
+
+    n1 = _find_label_name_by_index(context, li1)
+    n2 = _find_label_name_by_index(context, li2)
+    n3 = _find_label_name_by_index(context, li3)
+    n4 = _find_label_name_by_index(context, li4)
+
+    p.label_name_1 = n1
+    p.label_name_2 = n2
+    p.label_name_3 = n3
+    p.label_name_4 = n4
+
+    # Set enums by NAME (stable)
+    try: p.label_enum_1 = _label_name_to_enum(n1)
+    except: p.label_enum_1 = LABEL_NONE_ID
+    try: p.label_enum_2 = _label_name_to_enum(n2)
+    except: p.label_enum_2 = LABEL_NONE_ID
+    try: p.label_enum_3 = _label_name_to_enum(n3)
+    except: p.label_enum_3 = LABEL_NONE_ID
+    try: p.label_enum_4 = _label_name_to_enum(n4)
+    except: p.label_enum_4 = LABEL_NONE_ID
+
+    tele_u = _u8(OFF_TELE_CHAN)
+    if tele_u == 0xFF:
+        p.teleporter_channel_enum = "255"
+    elif 0 <= tele_u <= 25:
+        p.teleporter_channel_enum = str(int(tele_u))
+    else:
+        p.teleporter_channel_enum = "255"
+
+    pass_b = _u8(OFF_PASS_FLAGS)
+    p.pass_players_enum     = "BLOCK" if (pass_b & 0x01) else "ALLOW"
+    p.pass_land_enum        = "ALLOW" if (pass_b & 0x02) else "BLOCK"
+    p.pass_heavy_enum       = "ALLOW" if (pass_b & 0x04) else "BLOCK"
+    p.pass_flying_enum      = "ALLOW" if (pass_b & 0x08) else "BLOCK"
+    p.pass_projectiles_enum = "ALLOW" if (pass_b & 0x10) else "BLOCK"
+
+    try:
+        apply_scale_preview_if_needed(context, obj)
+    except:
+        pass
+
+    if slot_index_i >= 0:
+        obj["h2a_forge_slot"] = int(slot_index_i)
+
+def _read_all_entries_from_memory(context, base_addr: int, limit: int):
+    entries = []
+    for i in range(int(limit)):
+        raw = g_mb.read(base_addr + i * ENTRY_STRIDE, ENTRY_STRIDE)
+        if not raw or len(raw) != ENTRY_STRIDE:
+            break
+        if _entry_is_empty(raw):
+            if i == 0:
+                break
+            if not _entry_has_more_after(raw):
+                break
+            continue
+        entries.append((i, raw))
+        if not _entry_has_more_after(raw):
+            break
+    return entries
+
+# =============================================================================
+# RAW TEMPLATES
+# =============================================================================
+
+def _hex_to_bytes(s: str) -> bytes:
+    s = s.strip().replace("\n", " ").replace("\t", " ")
+    s = re.sub(r"[^0-9A-Fa-f]", " ", s)
+    parts = [p for p in s.split(" ") if p]
+    return bytes(int(p, 16) for p in parts)
+
+def _ensure_len(name: str, b: bytes, expected: int) -> bytes:
+    if len(b) == expected:
+        return b
+    if len(b) > expected:
+        return b[:expected]
+    return b + bytes([0] * (expected - len(b)))
+
+EMPTY_SLOT_HEX = """
+FF FF FF FF FF FF
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+FF FF
+00 00 00 00 00 00 00 00 00 00 00 00 00 00
+08 00 FF 00 00 00
+FF FF FF FF
+00 00 00 00
+"""
+EMPTY_SLOT_BYTES = _ensure_len("EMPTY_SLOT_BYTES", _hex_to_bytes(EMPTY_SLOT_HEX), ENTRY_STRIDE)
+
+def _init_entry_for_type(top_id: int, sub_id: int, pre3b: int) -> bytearray:
+    blob = bytearray(EMPTY_SLOT_BYTES)
+    blob[0] = int(top_id) & 0xFF
+    blob[1] = 0x00
+    blob[2:6] = b"\xFF\xFF\xFF\xFF"
+    blob[OFF_F32_A:OFF_F32_A+4] = _pack_f32(1.0)
+    blob[OFF_U16_FFFF:OFF_U16_FFFF+2] = _pack_u16(0xFFFF)
+
+    blob[OFF_U16_TYPECONST:OFF_U16_TYPECONST+2] = _pack_u16(int(sub_id) & 0xFF)
+    blob[OFF_PRE_FLAGS_BYTE] = int(pre3b) & 0xFF
+
+    _set_tail_flag(blob, False)
+    return blob
+
+# =============================================================================
 # Export core
 # =============================================================================
 
 def build_entry_bytes(context, obj: bpy.types.Object):
     """
     Build one 0x4C entry from a Blender object.
-    IMPORTANT:
-      - If obj is "unmapped" (imported modelless or unknown), export uses the stored
-        (top, sub, pre3b) so it DOES NOT turn into DEFAULT_OBJECT_TYPE on export.
-      - All other fields still export from the UI props (labels, flags, team, etc.).
+
+    LABELS:
+      - UI stores label NAMEs (stable).
+      - Export resolves those NAMEs to the CURRENT label table indices.
+      - If a name is missing in current table -> writes 0xFF (no label).
     """
     if not obj or not hasattr(obj, "h2a_forge"):
         return None
 
-    # Decide what type triple to export
     triple = get_export_type_triple(obj)
     if not triple:
         return None
 
     top_id, sub_id, pre3b = triple
-
-    # Initialize base entry with the export type triple
     blob = _init_entry_for_type(top_id, sub_id, int(pre3b) & 0xFF)
 
-    # Rotation basis: forward = col[0], up = col[2] (your existing convention)
     m = obj.matrix_world
     fwd = Vector(m.col[0].xyz).normalized()
     up  = Vector(m.col[2].xyz).normalized()
@@ -1679,17 +1650,26 @@ def build_entry_bytes(context, obj: bpy.types.Object):
 
     _write_u8(blob, OFF_SPAWN_CHAN, p.spawn_channel)
 
-    _write_u8(blob, OFF_LABEL_1, _label_enum_to_u8(p.label_enum_1))
-    _write_u8(blob, OFF_LABEL_2, _label_enum_to_u8(p.label_enum_2))
-    _write_u8(blob, OFF_LABEL_3, _label_enum_to_u8(p.label_enum_3))
-    _write_u8(blob, OFF_LABEL_4, _label_enum_to_u8(p.label_enum_4))
+    # Resolve label indices by NAME
+    n1 = (p.label_name_1 or _label_enum_to_name(getattr(p, "label_enum_1", LABEL_NONE_ID))).strip()
+    n2 = (p.label_name_2 or _label_enum_to_name(getattr(p, "label_enum_2", LABEL_NONE_ID))).strip()
+    n3 = (p.label_name_3 or _label_enum_to_name(getattr(p, "label_enum_3", LABEL_NONE_ID))).strip()
+    n4 = (p.label_name_4 or _label_enum_to_name(getattr(p, "label_enum_4", LABEL_NONE_ID))).strip()
 
-    _write_u8(blob, OFF_TELE_CHAN,  _label_enum_to_u8(p.teleporter_channel_enum))
+    i1 = _find_label_index_by_name(context, n1)
+    i2 = _find_label_index_by_name(context, n2)
+    i3 = _find_label_index_by_name(context, n3)
+    i4 = _find_label_index_by_name(context, n4)
+
+    _write_u8(blob, OFF_LABEL_1, i1)
+    _write_u8(blob, OFF_LABEL_2, i2)
+    _write_u8(blob, OFF_LABEL_3, i3)
+    _write_u8(blob, OFF_LABEL_4, i4)
+
+    _write_u8(blob, OFF_TELE_CHAN,  _clamp_u8(int(getattr(p, "teleporter_channel_enum", "255"))))
     _write_u8(blob, OFF_PASS_FLAGS, pack_passability_flags(p))
 
     return bytes(blob)
-
-
 
 def gather_forge_objects_in_scene(context):
     return [obj for obj in context.scene.objects if is_forge_object(obj)]
@@ -1731,16 +1711,16 @@ class H2AForgeRefreshLabels(Operator):
 
             sp.forge_labels.clear()
 
-            it = sp.forge_labels.add()
-            it.name = "(No Label)"
-            it.index = 0xFF
-
+            # NOTE: we do not store a special 0xFF entry here; the enum always provides "(No Label)" separately.
             for i, nm in enumerate(labels):
                 item = sp.forge_labels.add()
                 item.name = nm
                 item.index = i
 
-            self.report({"INFO"}, f"Loaded {len(labels)} forge labels from 0x{label_addr:X}.")
+            # IMPORTANT: keep dropdowns stable by re-binding from stored label_name_*.
+            _rebind_all_objects_after_label_refresh(context)
+
+            self.report({"INFO"}, f"Loaded {len(labels)} forge labels from 0x{label_addr:X} (name-mapped).")
             return {"FINISHED"}
 
         finally:
@@ -1835,7 +1815,16 @@ class H2AForgeImportMemory(Operator):
                 self.report({"ERROR"}, "mb_get_forge_object_array returned 0 (pointer chain failed).")
                 return {"CANCELLED"}
 
-            # Optional: clear existing forge objects
+            # Capture label blob snapshot (optional)
+            try:
+                label_addr = _label_blob_addr_from_forge_array(base_addr)
+                blob = g_mb.read(label_addr, LABEL_BLOB_SIZE)
+                if blob and len(blob) == LABEL_BLOB_SIZE:
+                    sp.imported_label_blob_b64 = _b64_from_bytes(blob)
+                    sp.imported_label_blob_size = len(blob)
+            except:
+                pass
+
             if sp.import_clear_existing:
                 to_del = [o for o in context.scene.objects if is_forge_object(o)]
                 for o in to_del:
@@ -1844,7 +1833,6 @@ class H2AForgeImportMemory(Operator):
                     except:
                         pass
 
-            # Read entries
             pairs = _read_all_entries_from_memory(context, base_addr, sp.import_limit)
 
             for slot_idx, entry in pairs:
@@ -1855,9 +1843,8 @@ class H2AForgeImportMemory(Operator):
                 template_name = _resolve_template_name_from_ids(top_id, sub_id, pre3b)
 
                 obj = _create_object_from_template_or_placeholder(context, template_name, top_id, sub_id, pre3b)
-                _apply_entry_to_object(context, obj, entry, top_id, sub_id, pre3b, template_name)
+                _apply_entry_to_object(context, obj, entry, slot_idx)
 
-                # Tag bookkeeping
                 obj["h2a_import_slot"] = int(slot_idx)
                 if not template_name or obj.get("h2a_import_unknown", False):
                     unknown += 1
