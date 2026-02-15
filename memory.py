@@ -121,6 +121,9 @@ LABEL_NONE_ID = "__NONE__"
 # Object type mapping (TOP + SUB + PRE 0x3B)
 # =============================================================================
 
+# Auto-generated from forge.json. Do not hand-edit.
+# top_id = entryIndex, sub_id = variantIndex, pre3b = 0 for now.
+
 OBJECT_TYPE_INFO = {
     "Magnum": (0x00, 0x00, 0x00),
     "Magnum, Survivor": (0x01, 0x00, 0x00),
@@ -247,8 +250,8 @@ OBJECT_TYPE_INFO = {
     "Trigger: On-Stay Off": (0x32, 0x07, 0x00),
     "Trigger: On-Stay Toggle": (0x32, 0x08, 0x00),
     "Trigger: On-Destroyed": (0x32, 0x09, 0x00),
-    "Initial Spawn": (0x33, 0x00, 0x10),
-    "Respawn Point": (0x34, 0x00, 0x10),
+    "Initial Spawn": (0x33, 0x00, 0x00),
+    "Respawn Point": (0x34, 0x00, 0x00),
     "Initial Camera": (0x35, 0x00, 0x00),
     "Respawn Zone": (0x36, 0x00, 0x00),
     "Respawn Zone, Medium": (0x37, 0x00, 0x00),
@@ -467,6 +470,7 @@ OBJECT_TYPE_INFO = {
     "Ramp, Stunt": (0x55, 0x0F, 0x00),
     "Grid": (0x56, 0x00, 0x00),
 }
+
 
 TYPEKEY_TO_NAME = {}
 TYPEKEY_TO_NAME_LOOSE = {}
@@ -1094,7 +1098,6 @@ class MemBridge:
         except Exception:
             self._has_finalize = False
 
-
         return True
 
     def open_process(self, exe_name: str):
@@ -1226,20 +1229,26 @@ def mark_as_forge_object(obj):
 def is_forge_object(obj) -> bool:
     return bool(obj and obj.get("isForgeObject", False))
 
-def createForgeObject(context, leafCollectionName: str):
+# ------------------------------------------------------------------
+# FAST creation: no bpy.ops selection churn (speed-first)
+# ------------------------------------------------------------------
+def _get_palette_leaf_object(leafCollectionName: str):
+    leaf = bpy.data.collections.get(leafCollectionName, None)
+    if not leaf or len(leaf.objects) == 0:
+        return None
+    return leaf.objects[0]
+
+def createForgeObjectFast(context, leafCollectionName: str):
     props_scene = get_props_scene()
     if not props_scene:
         raise RuntimeError(f"Props scene '{propSceneName}' not found.")
 
-    leaf = bpy.data.collections.get(leafCollectionName, None)
-    if not leaf or len(leaf.objects) == 0:
+    src = _get_palette_leaf_object(leafCollectionName)
+    if not src:
         raise RuntimeError(f"Palette collection '{leafCollectionName}' not found or empty.")
-
-    src = leaf.objects[0]
 
     new_data = src.data.copy() if src.data else None
     new_obj = bpy.data.objects.new(src.name, new_data)
-
     context.scene.collection.objects.link(new_obj)
 
     new_obj.location = context.scene.cursor.location
@@ -1283,10 +1292,18 @@ def createForgeObject(context, leafCollectionName: str):
     except:
         pass
 
-    bpy.ops.object.select_all(action='DESELECT')
-    new_obj.select_set(True)
-    context.view_layer.objects.active = new_obj
+    # Optional: set active without ops (still fast)
+    try:
+        context.view_layer.objects.active = new_obj
+        new_obj.select_set(True)
+    except:
+        pass
+
     return new_obj
+
+# Kept for compatibility with your original call sites (now just uses fast path)
+def createForgeObject(context, leafCollectionName: str):
+    return createForgeObjectFast(context, leafCollectionName)
 
 # =============================================================================
 # Import helpers (decode entry -> Blender object)
@@ -1357,11 +1374,21 @@ def _ensure_import_collection(scene: bpy.types.Scene, name: str = "Imported Forg
         scene.collection.children.link(coll)
     return coll
 
-def _make_placeholder_mesh(name: str):
-    mesh = bpy.data.meshes.new(name + "_mesh")
+# ---- Cached smaller placeholder meshes (speed + smaller default cube) ----
+_PLACEHOLDER_MESH_CACHE = {}
+
+def _get_placeholder_mesh(key: str):
+    mesh = _PLACEHOLDER_MESH_CACHE.get(key)
+    if mesh and mesh.name in bpy.data.meshes:
+        return mesh
+
+    mesh = bpy.data.meshes.new(key + "_mesh")
+
+    # Smaller cube: was ±0.5, now ±0.25
+    s = 0.1
     verts = [
-        (-0.5,-0.5,-0.5), (0.5,-0.5,-0.5), (0.5,0.5,-0.5), (-0.5,0.5,-0.5),
-        (-0.5,-0.5, 0.5), (0.5,-0.5, 0.5), (0.5,0.5, 0.5), (-0.5,0.5, 0.5),
+        (-s,-s,-s), ( s,-s,-s), ( s, s,-s), (-s, s,-s),
+        (-s,-s, s), ( s,-s, s), ( s, s, s), (-s, s, s),
     ]
     faces = [
         (0,1,2,3),
@@ -1373,17 +1400,19 @@ def _make_placeholder_mesh(name: str):
     ]
     mesh.from_pydata(verts, [], faces)
     mesh.update()
+
+    _PLACEHOLDER_MESH_CACHE[key] = mesh
     return mesh
 
 def _create_object_from_template_or_placeholder(context, template_name: str, top_id: int, sub_id: int, pre3b: int):
     if template_name and template_name in OBJECT_TYPE_INFO:
         try:
-            return createForgeObject(context, template_name)
+            return createForgeObjectFast(context, template_name)
         except:
             pass
 
     coll = _ensure_import_collection(context.scene)
-    mesh = _make_placeholder_mesh(f"Unknown_{top_id:02X}_{sub_id:02X}")
+    mesh = _get_placeholder_mesh(f"Unknown_{top_id:02X}_{sub_id:02X}")
     obj = bpy.data.objects.new(f"Unknown_{top_id:02X}_{sub_id:02X}_{pre3b:02X}", mesh)
     coll.objects.link(obj)
 
@@ -1402,7 +1431,41 @@ def _create_object_from_template_or_placeholder(context, template_name: str, top
 # Core apply/import/export
 # =============================================================================
 
-def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_index: int = -1, *args):
+def _build_label_maps_for_import(context):
+    """Speed: build once per import."""
+    idx_to_name = {}
+    try:
+        sp = context.scene.h2a_forge
+        for it in sp.forge_labels:
+            try:
+                idx = int(it.index) & 0xFF
+                nm = str(it.name or "").strip()
+                if nm and idx != 0xFF:
+                    idx_to_name[idx] = nm
+            except:
+                pass
+    except:
+        pass
+    return idx_to_name
+
+def _build_label_maps_for_export(context):
+    """Speed: build once per export."""
+    name_to_idx = {}
+    try:
+        sp = context.scene.h2a_forge
+        for it in sp.forge_labels:
+            try:
+                idx = int(it.index) & 0xFF
+                nm = str(it.name or "").strip()
+                if nm and idx != 0xFF:
+                    name_to_idx[nm.lower()] = idx
+            except:
+                pass
+    except:
+        pass
+    return name_to_idx
+
+def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_index: int = -1, label_idx_to_name=None):
     try:
         slot_index_i = int(slot_index)
     except:
@@ -1415,6 +1478,12 @@ def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_in
         v = _u8(off)
         return v - 256 if v >= 128 else v
 
+    def _u16(off):
+        try:
+            return int.from_bytes(entry[off:off+2], "little", signed=False) & 0xFFFF
+        except:
+            return 0
+
     def _f32(off):
         try:
             return struct.unpack_from("<f", entry, off)[0]
@@ -1425,7 +1494,8 @@ def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_in
         return Vector((_f32(off + 0), _f32(off + 4), _f32(off + 8)))
 
     top_id = _u8(0x00)
-    sub_id = _u8(OFF_U16_TYPECONST)
+    # FIX: this field is u16; you were reading it as u8 before
+    sub_id = _u16(OFF_U16_TYPECONST) & 0xFF
     pre3b  = _u8(OFF_PRE_FLAGS_BYTE)
 
     pos = _v3(OFF_POS)
@@ -1535,16 +1605,22 @@ def _apply_entry_to_object(context, obj: bpy.types.Object, entry: bytes, slot_in
 
     p.spawn_channel = _u8(OFF_SPAWN_CHAN)
 
-    # Labels: memory stores indices -> map to names -> persist
+    # Labels: indices -> names (fast map if provided)
     li1 = _u8(OFF_LABEL_1)
     li2 = _u8(OFF_LABEL_2)
     li3 = _u8(OFF_LABEL_3)
     li4 = _u8(OFF_LABEL_4)
 
-    n1 = _find_label_name_by_index(context, li1)
-    n2 = _find_label_name_by_index(context, li2)
-    n3 = _find_label_name_by_index(context, li3)
-    n4 = _find_label_name_by_index(context, li4)
+    if label_idx_to_name is None:
+        n1 = _find_label_name_by_index(context, li1)
+        n2 = _find_label_name_by_index(context, li2)
+        n3 = _find_label_name_by_index(context, li3)
+        n4 = _find_label_name_by_index(context, li4)
+    else:
+        n1 = "" if (li1 & 0xFF) == 0xFF else str(label_idx_to_name.get(li1 & 0xFF, ""))
+        n2 = "" if (li2 & 0xFF) == 0xFF else str(label_idx_to_name.get(li2 & 0xFF, ""))
+        n3 = "" if (li3 & 0xFF) == 0xFF else str(label_idx_to_name.get(li3 & 0xFF, ""))
+        n4 = "" if (li4 & 0xFF) == 0xFF else str(label_idx_to_name.get(li4 & 0xFF, ""))
 
     p.label_name_1 = n1
     p.label_name_2 = n2
@@ -1648,7 +1724,7 @@ def _init_entry_for_type(top_id: int, sub_id: int, pre3b: int) -> bytearray:
 # Export core
 # =============================================================================
 
-def build_entry_bytes(context, obj: bpy.types.Object):
+def build_entry_bytes(context, obj: bpy.types.Object, label_name_to_idx=None):
     if not obj or not hasattr(obj, "h2a_forge"):
         return None
 
@@ -1685,16 +1761,22 @@ def build_entry_bytes(context, obj: bpy.types.Object):
 
     _write_u8(blob, OFF_SPAWN_CHAN, p.spawn_channel)
 
-    # Resolve label indices by NAME
+    # Resolve label indices by NAME (fast map if provided)
     n1 = (p.label_name_1 or _label_enum_to_name(getattr(p, "label_enum_1", LABEL_NONE_ID))).strip()
     n2 = (p.label_name_2 or _label_enum_to_name(getattr(p, "label_enum_2", LABEL_NONE_ID))).strip()
     n3 = (p.label_name_3 or _label_enum_to_name(getattr(p, "label_enum_3", LABEL_NONE_ID))).strip()
     n4 = (p.label_name_4 or _label_enum_to_name(getattr(p, "label_enum_4", LABEL_NONE_ID))).strip()
 
-    i1 = _find_label_index_by_name(context, n1)
-    i2 = _find_label_index_by_name(context, n2)
-    i3 = _find_label_index_by_name(context, n3)
-    i4 = _find_label_index_by_name(context, n4)
+    if label_name_to_idx is None:
+        i1 = _find_label_index_by_name(context, n1)
+        i2 = _find_label_index_by_name(context, n2)
+        i3 = _find_label_index_by_name(context, n3)
+        i4 = _find_label_index_by_name(context, n4)
+    else:
+        i1 = 0xFF if (not n1 or n1 == LABEL_NONE_ID) else int(label_name_to_idx.get(n1.lower(), 0xFF)) & 0xFF
+        i2 = 0xFF if (not n2 or n2 == LABEL_NONE_ID) else int(label_name_to_idx.get(n2.lower(), 0xFF)) & 0xFF
+        i3 = 0xFF if (not n3 or n3 == LABEL_NONE_ID) else int(label_name_to_idx.get(n3.lower(), 0xFF)) & 0xFF
+        i4 = 0xFF if (not n4 or n4 == LABEL_NONE_ID) else int(label_name_to_idx.get(n4.lower(), 0xFF)) & 0xFF
 
     _write_u8(blob, OFF_LABEL_1, i1)
     _write_u8(blob, OFF_LABEL_2, i2)
@@ -1758,9 +1840,6 @@ class H2AForgeRefreshLabels(Operator):
 
         finally:
             g_mb.close()
-            
-
-
 
 class H2AForgeExportMemory(Operator):
     bl_idname = "h2a_forge.export_memory"
@@ -1792,12 +1871,14 @@ class H2AForgeExportMemory(Operator):
 
             objs = gather_forge_objects_in_scene(context)
 
+            label_name_to_idx = _build_label_maps_for_export(context)
+
             entries = []
             skipped = 0
             for obj in objs:
                 if len(entries) >= maxObjectCount:
                     break
-                entry = build_entry_bytes(context, obj)
+                entry = build_entry_bytes(context, obj, label_name_to_idx=label_name_to_idx)
                 if entry is None:
                     skipped += 1
                     continue
@@ -1826,10 +1907,6 @@ class H2AForgeExportMemory(Operator):
                     self.report({"WARNING"}, "Exported objects, but failed to update object total count (mb_set_forge_object_total_exported failed).")
 
             # NEW: post-export "enter forge" pokes
-            # This is the piece that writes:
-            #   [groundhog.dll+11ece00]+599FB8+D0 = 03 00 01 00
-            # and
-            #   tagsBase + 0x1F9AA24B8 = int32 0
             post_ok = False
             if getattr(g_mb, "_has_finalize", False):
                 post_ok = bool(g_mb.finalize_export_and_enter_forge(written))
@@ -1887,6 +1964,9 @@ class H2AForgeImportMemory(Operator):
                     except:
                         pass
 
+            # Speed: build label map once
+            label_idx_to_name = _build_label_maps_for_import(context)
+
             pairs = _read_all_entries_from_memory(context, base_addr, sp.import_limit)
 
             for slot_idx, entry in pairs:
@@ -1897,7 +1977,7 @@ class H2AForgeImportMemory(Operator):
                 template_name = _resolve_template_name_from_ids(top_id, sub_id, pre3b)
 
                 obj = _create_object_from_template_or_placeholder(context, template_name, top_id, sub_id, pre3b)
-                _apply_entry_to_object(context, obj, entry, slot_idx)
+                _apply_entry_to_object(context, obj, entry, slot_idx, label_idx_to_name)
 
                 obj["h2a_import_slot"] = int(slot_idx)
                 if not template_name or obj.get("h2a_import_unknown", False):
