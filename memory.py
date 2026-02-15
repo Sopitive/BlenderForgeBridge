@@ -1003,6 +1003,11 @@ class MemBridge:
         self._has_write_force = False
         self._has_set_total = False
 
+        # NEW exports (optional)
+        self._has_tags_base = False
+        self._has_post_export = False
+        self._has_finalize = False
+
     def _candidate_paths(self):
         blend_dir = bpy.path.abspath("//")
         if blend_dir:
@@ -1062,6 +1067,34 @@ class MemBridge:
         except Exception:
             self._has_set_total = False
 
+        # ------------------------------------------------------------
+        # NEW exports (optional). These will only bind if present in the DLL.
+        # ------------------------------------------------------------
+        self._has_tags_base = False
+        try:
+            self.dll.mb_get_h2a_tags_base.argtypes = [c_void_p]
+            self.dll.mb_get_h2a_tags_base.restype  = c_uint64
+            self._has_tags_base = True
+        except Exception:
+            self._has_tags_base = False
+
+        self._has_post_export = False
+        try:
+            self.dll.mb_post_export_enter_forge.argtypes = [c_void_p]
+            self.dll.mb_post_export_enter_forge.restype  = c_int
+            self._has_post_export = True
+        except Exception:
+            self._has_post_export = False
+
+        self._has_finalize = False
+        try:
+            self.dll.mb_finalize_export_and_enter_forge.argtypes = [c_void_p, c_int]
+            self.dll.mb_finalize_export_and_enter_forge.restype  = c_int
+            self._has_finalize = True
+        except Exception:
+            self._has_finalize = False
+
+
         return True
 
     def open_process(self, exe_name: str):
@@ -1110,6 +1143,36 @@ class MemBridge:
             return False
         try:
             rc = self.dll.mb_set_forge_object_total_exported(self.hproc, c_int(int(exported_count)))
+            return rc == 1
+        except:
+            return False
+
+    # ---------------------------
+    # NEW wrappers (optional)
+    # ---------------------------
+    def get_h2a_tags_base(self) -> int:
+        if not self._has_tags_base:
+            return 0
+        try:
+            v = self.dll.mb_get_h2a_tags_base(self.hproc)
+            return int(v) if v else 0
+        except:
+            return 0
+
+    def post_export_enter_forge(self) -> bool:
+        if not self._has_post_export:
+            return False
+        try:
+            rc = self.dll.mb_post_export_enter_forge(self.hproc)
+            return rc == 1
+        except:
+            return False
+
+    def finalize_export_and_enter_forge(self, exported_count: int) -> bool:
+        if not self._has_finalize:
+            return False
+        try:
+            rc = self.dll.mb_finalize_export_and_enter_forge(self.hproc, c_int(int(exported_count)))
             return rc == 1
         except:
             return False
@@ -1695,6 +1758,9 @@ class H2AForgeRefreshLabels(Operator):
 
         finally:
             g_mb.close()
+            
+
+
 
 class H2AForgeExportMemory(Operator):
     bl_idname = "h2a_forge.export_memory"
@@ -1717,6 +1783,7 @@ class H2AForgeExportMemory(Operator):
         base_addr = 0
         written = 0
         skipped = 0
+
         try:
             base_addr = g_mb.get_forge_object_array()
             if base_addr == 0:
@@ -1738,6 +1805,7 @@ class H2AForgeExportMemory(Operator):
 
             written = len(entries)
 
+            # Write all slots (pad remainder with empty)
             for i in range(maxObjectCount):
                 if i < written:
                     b = bytearray(entries[i])
@@ -1751,16 +1819,32 @@ class H2AForgeExportMemory(Operator):
                     self.report({"ERROR"}, f"Write failed at slot {i} addr=0x{addr:X} (dll='{g_mb.dll_path}')")
                     return {"CANCELLED"}
 
-            if g_mb._has_set_total:
+            # Best-effort: update forge "total exported" counter (existing behavior)
+            if getattr(g_mb, "_has_set_total", False):
                 ok = g_mb.set_forge_object_total(written)
                 if not ok:
                     self.report({"WARNING"}, "Exported objects, but failed to update object total count (mb_set_forge_object_total_exported failed).")
+
+            # NEW: post-export "enter forge" pokes
+            # This is the piece that writes:
+            #   [groundhog.dll+11ece00]+599FB8+D0 = 03 00 01 00
+            # and
+            #   tagsBase + 0x1F9AA24B8 = int32 0
+            post_ok = False
+            if getattr(g_mb, "_has_finalize", False):
+                post_ok = bool(g_mb.finalize_export_and_enter_forge(written))
+            elif getattr(g_mb, "_has_post_export", False):
+                post_ok = bool(g_mb.post_export_enter_forge())
+
+            if not post_ok:
+                self.report({"WARNING"}, "Exported objects, but post-export enter-forge poke failed (mb_post_export_enter_forge/mb_finalize_export_and_enter_forge).")
 
         finally:
             g_mb.close()
 
         self.report({"INFO"}, f"Exported {written} objects (skipped {skipped}) and padded to {maxObjectCount}. base=0x{base_addr:X}")
         return {"FINISHED"}
+
 
 class H2AForgeImportMemory(Operator):
     bl_idname = "h2a_forge.import_memory"
